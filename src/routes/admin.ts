@@ -20,7 +20,7 @@ import {
   updateApiKeyStatus,
 } from "../repo/apiKeys";
 import { displayKey } from "../utils/crypto";
-import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
+import { createAdminSession, deleteAdminSession, verifyAdminSession } from "../repo/adminSessions";
 import {
   addTokens,
   applyCooldown,
@@ -48,6 +48,9 @@ import {
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
+import { createTask, getTask, deleteTask, createBatchEventStream } from "../batch";
+import { batchEnableNsfw } from "../services/nsfw";
+import { batchRefreshTokens } from "../services/refresh";
 
 function jsonError(message: string, code: string): Record<string, unknown> {
   return { error: message, code };
@@ -758,6 +761,175 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     return c.json(legacyOk({ results }));
   } catch (e) {
     return c.json(legacyErr(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+// Async batch refresh with SSE progress
+adminRoutes.post("/api/v1/admin/tokens/refresh/async", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const tokens: string[] = [];
+    if (body && typeof body === "object") {
+      if (typeof body.token === "string") tokens.push(body.token);
+      if (Array.isArray(body.tokens)) tokens.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+    const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!unique.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const settings = await getSettings(c.env);
+
+    // Get token types from database
+    const placeholders = unique.map(() => "?").join(",");
+    const typeRows = await dbAll<{ token: string; token_type: string }>(
+      c.env.DB,
+      `SELECT token, token_type FROM tokens WHERE token IN (${placeholders})`,
+      unique,
+    );
+
+    const tokenItems = typeRows.map((r) => ({
+      token: r.token,
+      token_type: r.token_type as "sso" | "ssoSuper",
+    }));
+
+    // Create batch task
+    const task = createTask(tokenItems.length);
+
+    // Start async processing
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          const results = await batchRefreshTokens(c.env.DB, tokenItems, settings.grok, {
+            batchSize: 10,
+            task,
+            shouldCancel: () => task.cancelled,
+          });
+
+          const summary = {
+            total: tokenItems.length,
+            success: Array.from(results.values()).filter((r) => r.success).length,
+            failed: Array.from(results.values()).filter((r) => !r.success).length,
+          };
+
+          task.finish(summary);
+
+          // Auto-cleanup after 5 minutes
+          setTimeout(() => deleteTask(task.id), 300000);
+        } catch (e) {
+          task.failTask(e instanceof Error ? e.message : String(e));
+        }
+      })(),
+    );
+
+    return c.json(legacyOk({ task_id: task.id, total: tokenItems.length }));
+  } catch (e) {
+    return c.json(legacyErr(`Async refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+// Batch enable NSFW
+adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const tokens: string[] = [];
+    if (body && typeof body === "object") {
+      if (typeof body.token === "string") tokens.push(body.token);
+      if (Array.isArray(body.tokens)) tokens.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+    const unique = [...new Set(tokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!unique.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    // Create batch task
+    const task = createTask(unique.length);
+
+    // Start async processing
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          const results = await batchEnableNsfw(c.env.DB, unique, {
+            batchSize: 10,
+            task,
+            shouldCancel: () => task.cancelled,
+          });
+
+          const summary = {
+            total: unique.length,
+            success: Array.from(results.values()).filter((r) => r.success).length,
+            failed: Array.from(results.values()).filter((r) => !r.success).length,
+          };
+
+          task.finish(summary);
+
+          // Auto-cleanup after 5 minutes
+          setTimeout(() => deleteTask(task.id), 300000);
+        } catch (e) {
+          task.failTask(e instanceof Error ? e.message : String(e));
+        }
+      })(),
+    );
+
+    return c.json(legacyOk({ task_id: task.id, total: unique.length }));
+  } catch (e) {
+    return c.json(legacyErr(`NSFW enable failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+// SSE stream for batch task progress
+adminRoutes.get("/api/v1/admin/batch/:task_id/stream", async (c) => {
+  try {
+    // Support auth from query parameter for EventSource compatibility
+    const authFromQuery = c.req.query("auth");
+    const authFromHeader = c.req.header("Authorization");
+    const token = authFromQuery || (authFromHeader ? authFromHeader.replace(/^Bearer\s+/i, "") : null);
+
+    if (!token) {
+      return c.json(legacyErr("Missing authentication"), 401);
+    }
+
+    const ok = await verifyAdminSession(c.env.DB, token);
+    if (!ok) {
+      return c.json(legacyErr("Session expired"), 401);
+    }
+
+    const taskId = c.req.param("task_id");
+    const task = getTask(taskId);
+
+    if (!task) {
+      return c.json(legacyErr("Task not found"), 404);
+    }
+
+    const stream = createBatchEventStream(task);
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (e) {
+    return c.json(legacyErr(`Stream failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+// Cancel batch task
+adminRoutes.post("/api/v1/admin/batch/:task_id/cancel", requireAdminAuth, async (c) => {
+  try {
+    const taskId = c.req.param("task_id");
+    const task = getTask(taskId);
+
+    if (!task) {
+      return c.json(legacyErr("Task not found"), 404);
+    }
+
+    task.cancel();
+    task.finishCancelled();
+
+    return c.json(legacyOk({ message: "Task cancelled", task_id: taskId }));
+  } catch (e) {
+    return c.json(legacyErr(`Cancel failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 

@@ -1149,14 +1149,145 @@ async function refreshStatus(token, btnEl) {
   }
 }
 
+// Batch task tracking
+let currentBatchTaskId = null;
+let batchEventSource = null;
+
+function closeBatchEventSource() {
+  if (batchEventSource) {
+    batchEventSource.close();
+    batchEventSource = null;
+  }
+}
+
+async function startBatchTaskWithProgress(endpoint, tokens, taskName) {
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ tokens })
+    });
+
+    const payload = await parseJsonSafely(res);
+    if (!res.ok) {
+      showToast(extractApiErrorMessage(payload, `${taskName}启动失败`), 'error');
+      return null;
+    }
+
+    const taskId = payload?.task_id;
+    const total = payload?.total || 0;
+
+    if (!taskId) {
+      showToast(`${taskName}启动失败：无任务ID`, 'error');
+      return null;
+    }
+
+    currentBatchTaskId = taskId;
+    showToast(`${taskName}已启动，共 ${total} 个 Token`, 'info');
+
+    // Start SSE stream
+    listenBatchProgress(taskId, taskName);
+
+    return taskId;
+  } catch (e) {
+    showToast(`${taskName}启动失败: ${e.message}`, 'error');
+    return null;
+  }
+}
+
+function listenBatchProgress(taskId, taskName) {
+  closeBatchEventSource();
+
+  const url = `/api/v1/admin/batch/${taskId}/stream`;
+  const headers = buildAuthHeaders(apiKey);
+  const authHeader = headers['Authorization'];
+
+  batchEventSource = new EventSource(`${url}?auth=${encodeURIComponent(authHeader)}`);
+
+  batchEventSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'progress') {
+        const percent = data.total > 0 ? Math.round((data.processed / data.total) * 100) : 0;
+        updateBatchProgress(taskName, data.processed, data.total, percent);
+      } else if (data.type === 'done') {
+        closeBatchEventSource();
+        currentBatchTaskId = null;
+        const summary = data.result || {};
+        showToast(
+          `${taskName}完成：成功 ${summary.success || 0}，失败 ${summary.failed || 0}`,
+          'success'
+        );
+        hideBatchProgress();
+        loadData();
+      } else if (data.type === 'error') {
+        closeBatchEventSource();
+        currentBatchTaskId = null;
+        showToast(`${taskName}失败: ${data.error}`, 'error');
+        hideBatchProgress();
+      } else if (data.type === 'cancelled') {
+        closeBatchEventSource();
+        currentBatchTaskId = null;
+        showToast(`${taskName}已取消`, 'info');
+        hideBatchProgress();
+      }
+    } catch (e) {
+      console.error('Parse SSE event failed:', e);
+    }
+  };
+
+  batchEventSource.onerror = () => {
+    closeBatchEventSource();
+    currentBatchTaskId = null;
+    showToast(`${taskName}连接中断`, 'error');
+    hideBatchProgress();
+  };
+}
+
+function updateBatchProgress(taskName, processed, total, percent) {
+  const progressEl = document.getElementById('batch-progress');
+  const progressBar = document.getElementById('batch-progress-bar');
+  const progressText = document.getElementById('batch-progress-text');
+
+  if (progressEl) progressEl.classList.remove('hidden');
+  if (progressBar) progressBar.style.width = `${percent}%`;
+  if (progressText) progressText.textContent = `${taskName}: ${processed}/${total} (${percent}%)`;
+}
+
+function hideBatchProgress() {
+  const progressEl = document.getElementById('batch-progress');
+  if (progressEl) progressEl.classList.add('hidden');
+}
+
+async function cancelBatchTask() {
+  if (!currentBatchTaskId) return;
+
+  try {
+    const res = await fetch(`/api/v1/admin/batch/${currentBatchTaskId}/cancel`, {
+      method: 'POST',
+      headers: buildAuthHeaders(apiKey)
+    });
+
+    if (!res.ok) {
+      showToast('取消失败', 'error');
+    }
+  } catch (e) {
+    showToast(`取消失败: ${e.message}`, 'error');
+  }
+}
+
 async function refreshAllNsfw() {
-  if (isNsfwRefreshAllRunning) {
-    showToast('NSFW 刷新任务进行中', 'info');
+  if (isNsfwRefreshAllRunning || currentBatchTaskId) {
+    showToast('已有任务进行中', 'info');
     return;
   }
 
   const ok = await confirmAction(
-    '将对全部 Token 执行：同意用户协议 + 设置年龄 + 开启 NSFW。未成功的 Token 会自动标记为失效，是否继续？',
+    '将对全部 Token 执行：同意用户协议 + 设置年龄 + 开启 NSFW。是否继续？',
     { okText: '开始刷新' }
   );
   if (!ok) return;
@@ -1166,35 +1297,21 @@ async function refreshAllNsfw() {
   isNsfwRefreshAllRunning = true;
   if (btn) {
     btn.disabled = true;
-    btn.innerHTML = '刷新中...';
+    btn.innerHTML = '启动中...';
   }
 
   try {
-    const res = await fetch('/api/v1/admin/tokens/nsfw/refresh', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildAuthHeaders(apiKey)
-      },
-      body: JSON.stringify({ all: true })
-    });
-
-    const payload = await parseJsonSafely(res);
-    if (!res.ok) {
-      showToast(extractApiErrorMessage(payload, 'NSFW 刷新失败'), 'error');
-      return;
-    }
-
-    const summary = payload?.summary || {};
-    const total = Number(summary.total || 0);
-    const success = Number(summary.success || 0);
-    const failed = Number(summary.failed || 0);
-    const invalidated = Number(summary.invalidated || 0);
-    showToast(
-      `NSFW 刷新完成：总计 ${total}，成功 ${success}，失败 ${failed}，失效 ${invalidated}`,
-      failed > 0 ? 'info' : 'success'
+    const tokens = flatTokens.map(t => t.token);
+    const taskId = await startBatchTaskWithProgress(
+      '/api/v1/admin/tokens/nsfw/enable',
+      tokens,
+      'NSFW 批量启用'
     );
-    loadData();
+
+    if (!taskId && btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalText;
+    }
   } catch (e) {
     showToast(e?.message ? `NSFW 刷新失败: ${e.message}` : 'NSFW 刷新失败', 'error');
   } finally {

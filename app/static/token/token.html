@@ -58,6 +58,17 @@
 
       <div class="h-px bg-[var(--border)] my-6"></div>
 
+      <!-- Batch Progress Bar -->
+      <div id="batch-progress" class="hidden mb-4 bg-white border border-[var(--border)] rounded-lg p-4">
+        <div class="flex items-center justify-between mb-2">
+          <span id="batch-progress-text" class="text-sm text-[var(--accents-5)]">处理中...</span>
+          <button onclick="cancelBatchTask()" class="text-xs text-red-600 hover:text-red-700">取消</button>
+        </div>
+        <div class="w-full bg-gray-200 rounded-full h-2">
+          <div id="batch-progress-bar" class="bg-blue-600 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+      </div>
+
       <!-- Statistics -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6" id="stats-container">
         <!-- Row 1 -->
