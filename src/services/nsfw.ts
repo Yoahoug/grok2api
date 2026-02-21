@@ -67,6 +67,8 @@ async function setBirthDate(token: string): Promise<GrpcStatus> {
   );
 
   // Payload: birth_date with year=1990, month=1, day=1
+  // Using 1990-01-01 as a fixed date that satisfies the 18+ age requirement
+  // for NSFW content access while being a clearly fictional/placeholder date.
   // Protobuf: field 1 (message) containing year(1)=1990, month(2)=1, day(3)=1
   // \x0a\x0a\x08\xc6\x0f\x10\x01\x18\x01
   const payload = GrpcWebClient.encodePayload(

@@ -98,8 +98,10 @@ export class BatchTask {
   attach(): { queue: unknown[]; push: (event: BatchEvent) => void } {
     const queue: unknown[] = [];
     const push = (event: BatchEvent) => {
-      if (queue.length < 200) {
+      if (queue.length < 1000) {
         queue.push(event);
+      } else {
+        console.warn(`[BatchTask] Event queue full for task ${this.id}, dropping event: ${event.type}`);
       }
     };
     const handle = { queue, push };
@@ -168,7 +170,7 @@ export class BatchTask {
     this.publish(event);
   }
 
-  failTask(error: string): void {
+  finishWithError(error: string): void {
     this.status = "error";
     this.error = error;
 
@@ -211,21 +213,68 @@ export class BatchTask {
   }
 }
 
-// Global task registry
-const TASKS = new Map<string, BatchTask>();
+/**
+ * Registry interface for managing BatchTask instances.
+ *
+ * In Cloudflare Workers, you should provide an implementation backed by
+ * Durable Objects or a database (e.g. D1) and inject it via setTaskRegistry.
+ */
+interface TaskRegistry {
+  create(total: number): BatchTask;
+  get(taskId: string): BatchTask | undefined;
+  delete(taskId: string): void;
+}
+
+/**
+ * Default in-memory task registry.
+ *
+ * NOTE: This implementation is not reliable across Cloudflare Worker
+ * instances and is intended only for local development or single-request
+ * usage. In production on Workers, use setTaskRegistry() to supply a
+ * Durable Object or database-backed implementation.
+ */
+class InMemoryTaskRegistry implements TaskRegistry {
+  private readonly tasks = new Map<string, BatchTask>();
+
+  create(total: number): BatchTask {
+    const task = new BatchTask(total);
+    this.tasks.set(task.id, task);
+    return task;
+  }
+
+  get(taskId: string): BatchTask | undefined {
+    return this.tasks.get(taskId);
+  }
+
+  delete(taskId: string): void {
+    this.tasks.delete(taskId);
+  }
+}
+
+// Configurable global task registry; defaults to in-memory.
+let taskRegistry: TaskRegistry = new InMemoryTaskRegistry();
+
+/**
+ * Replace the default task registry with a custom implementation.
+ *
+ * In a Cloudflare Worker, call this during startup to provide a
+ * Durable Object or database-backed registry that is safe across
+ * multiple requests and worker instances.
+ */
+export function setTaskRegistry(registry: TaskRegistry): void {
+  taskRegistry = registry;
+}
 
 export function createTask(total: number): BatchTask {
-  const task = new BatchTask(total);
-  TASKS.set(task.id, task);
-  return task;
+  return taskRegistry.create(total);
 }
 
 export function getTask(taskId: string): BatchTask | undefined {
-  return TASKS.get(taskId);
+  return taskRegistry.get(taskId);
 }
 
 export function deleteTask(taskId: string): void {
-  TASKS.delete(taskId);
+  taskRegistry.delete(taskId);
 }
 
 /**
@@ -261,6 +310,8 @@ export async function runBatch<T, R>(
   };
 
   // Process in batches to avoid creating too many concurrent promises
+  // NOTE: Cancellation takes effect between chunks. Items already being processed
+  // in the current chunk will run to completion before cancellation is applied.
   for (let i = 0; i < items.length; i += batchSize) {
     if ((options.shouldCancel?.() ?? false) || (options.task?.cancelled ?? false)) {
       break;
@@ -274,6 +325,11 @@ export async function runBatch<T, R>(
 
 /**
  * Create SSE stream from BatchTask
+ *
+ * NOTE: setInterval is used here for polling the event queue. This approach
+ * has limitations in Cloudflare Workers where long-running timers may not
+ * function reliably. For production use with Workers, consider Durable Objects
+ * with WebSocket support, or have the client poll a status endpoint instead.
  */
 export function createBatchEventStream(task: BatchTask): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();

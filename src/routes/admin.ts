@@ -48,7 +48,7 @@ import {
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
-import { createTask, getTask, deleteTask, createBatchEventStream } from "../batch";
+import { createTask, getTask, createBatchEventStream } from "../batch";
 import { batchEnableNsfw } from "../services/nsfw";
 import { batchRefreshTokens } from "../services/refresh";
 
@@ -811,11 +811,8 @@ adminRoutes.post("/api/v1/admin/tokens/refresh/async", requireAdminAuth, async (
           };
 
           task.finish(summary);
-
-          // Auto-cleanup after 5 minutes
-          setTimeout(() => deleteTask(task.id), 300000);
         } catch (e) {
-          task.failTask(e instanceof Error ? e.message : String(e));
+          task.finishWithError(e instanceof Error ? e.message : String(e));
         }
       })(),
     );
@@ -858,11 +855,8 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c)
           };
 
           task.finish(summary);
-
-          // Auto-cleanup after 5 minutes
-          setTimeout(() => deleteTask(task.id), 300000);
         } catch (e) {
-          task.failTask(e instanceof Error ? e.message : String(e));
+          task.finishWithError(e instanceof Error ? e.message : String(e));
         }
       })(),
     );
@@ -879,7 +873,10 @@ adminRoutes.get("/api/v1/admin/batch/:task_id/stream", async (c) => {
     // Support auth from query parameter for EventSource compatibility
     const authFromQuery = c.req.query("auth");
     const authFromHeader = c.req.header("Authorization");
-    const token = authFromQuery || (authFromHeader ? authFromHeader.replace(/^Bearer\s+/i, "") : null);
+    // Strip Bearer prefix from both sources to extract the raw token
+    const token =
+      (authFromQuery ? authFromQuery.replace(/^Bearer\s+/i, "") : null) ||
+      (authFromHeader ? authFromHeader.replace(/^Bearer\s+/i, "") : null);
 
     if (!token) {
       return c.json(legacyErr("Missing authentication"), 401);
@@ -899,6 +896,8 @@ adminRoutes.get("/api/v1/admin/batch/:task_id/stream", async (c) => {
 
     const stream = createBatchEventStream(task);
 
+    const requestOrigin = c.req.header("Origin");
+
     return new Response(stream, {
       status: 200,
       headers: {
@@ -906,7 +905,7 @@ adminRoutes.get("/api/v1/admin/batch/:task_id/stream", async (c) => {
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
-        "Access-Control-Allow-Origin": "*",
+        ...(requestOrigin ? { "Access-Control-Allow-Origin": requestOrigin, Vary: "Origin" } : {}),
       },
     });
   } catch (e) {

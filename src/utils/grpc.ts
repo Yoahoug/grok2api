@@ -56,10 +56,10 @@ export class GrpcWebClient {
 
       const flag = decoded[i];
       const length =
-        (decoded[i + 1] << 24) |
-        (decoded[i + 2] << 16) |
-        (decoded[i + 3] << 8) |
-        decoded[i + 4];
+        (((decoded[i + 1] << 24) |
+          (decoded[i + 2] << 16) |
+          (decoded[i + 3] << 8) |
+          decoded[i + 4]) >>> 0);
       i += 5;
 
       if (n - i < length) break;
@@ -75,8 +75,14 @@ export class GrpcWebClient {
           const colonIdx = line.indexOf(":");
           if (colonIdx > 0) {
             const key = line.slice(0, colonIdx).trim().toLowerCase();
-            const value = line.slice(colonIdx + 1).trim();
-            trailers.set(key, decodeURIComponent(value));
+            const raw = line.slice(colonIdx + 1).trim();
+            let value = raw;
+            try {
+              value = decodeURIComponent(raw);
+            } catch {
+              // Fall back to original value if percent-encoding is invalid
+            }
+            trailers.set(key, value);
           }
         }
       } else if (flag & 0x01) {
@@ -95,7 +101,13 @@ export class GrpcWebClient {
         trailers.set("grpc-status", status);
       }
       if (message && !trailers.has("grpc-message")) {
-        trailers.set("grpc-message", decodeURIComponent(message));
+        let decodedMessage = message;
+        try {
+          decodedMessage = decodeURIComponent(message);
+        } catch {
+          // Fall back to original value if percent-encoding is invalid
+        }
+        trailers.set("grpc-message", decodedMessage);
       }
     }
 

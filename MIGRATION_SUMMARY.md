@@ -218,7 +218,8 @@
 
 ### 2. SSE 连接
 - Workers 不支持长连接
-- 使用轮询模式实现 SSE
+- 当前实现使用 `setInterval` 轮询内存队列，在 Workers 中可能不可靠
+- 生产环境建议使用 Durable Objects + WebSocket，或改为客户端轮询状态端点
 - 自动重连机制
 
 ### 3. 并发控制

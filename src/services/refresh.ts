@@ -12,8 +12,6 @@ import { getDynamicHeaders } from "../grok/headers";
 import { toRateLimitModel } from "../grok/models";
 import type { GrokSettings } from "../settings";
 import { BatchTask, runBatch } from "../batch";
-import { dbRun, dbFirst } from "../db";
-import { nowMs } from "../utils/time";
 import { recordTokenFailure, applyCooldown, type TokenType } from "../repo/tokens";
 
 const RATE_LIMIT_API = "https://grok.com/rest/rate-limits";
@@ -82,9 +80,7 @@ export async function refreshToken(
     }
 
     // Update token in database
-    const now = nowMs();
-    await dbRun(
-      db,
+    const updateResult = await db.prepare(
       `UPDATE tokens
        SET remaining_queries = ?,
            heavy_remaining_queries = ?,
@@ -93,8 +89,15 @@ export async function refreshToken(
            last_failure_time = NULL,
            last_failure_reason = NULL
        WHERE token = ?`,
-      [limits.remaining, limits.heavy_remaining, token],
-    );
+    ).bind(limits.remaining, limits.heavy_remaining, token).run();
+
+    if (!updateResult.meta.changes) {
+      return {
+        success: false,
+        error: "Token not found in database",
+        status: 404,
+      };
+    }
 
     // Check if token is exhausted
     if (limits.remaining === 0 || (tokenType === "ssoSuper" && limits.heavy_remaining === 0)) {
@@ -154,79 +157,4 @@ export async function batchRefreshTokens(
   }
 
   return mapped;
-}
-
-/**
- * Get refresh progress from database
- */
-export async function getRefreshProgress(db: Env["DB"]): Promise<{
-  running: boolean;
-  current: number;
-  total: number;
-  success: number;
-  failed: number;
-  updated_at: number;
-}> {
-  const row = await dbFirst<{
-    running: number;
-    current: number;
-    total: number;
-    success: number;
-    failed: number;
-    updated_at: number;
-  }>(db, "SELECT running, current, total, success, failed, updated_at FROM token_refresh_progress WHERE id = 1");
-
-  return {
-    running: Boolean(row?.running ?? 0),
-    current: row?.current ?? 0,
-    total: row?.total ?? 0,
-    success: row?.success ?? 0,
-    failed: row?.failed ?? 0,
-    updated_at: row?.updated_at ?? 0,
-  };
-}
-
-/**
- * Update refresh progress in database
- */
-export async function updateRefreshProgress(
-  db: Env["DB"],
-  updates: {
-    running?: boolean;
-    current?: number;
-    total?: number;
-    success?: number;
-    failed?: number;
-  },
-): Promise<void> {
-  const parts: string[] = [];
-  const params: unknown[] = [];
-
-  if (updates.running !== undefined) {
-    parts.push("running = ?");
-    params.push(updates.running ? 1 : 0);
-  }
-  if (updates.current !== undefined) {
-    parts.push("current = ?");
-    params.push(updates.current);
-  }
-  if (updates.total !== undefined) {
-    parts.push("total = ?");
-    params.push(updates.total);
-  }
-  if (updates.success !== undefined) {
-    parts.push("success = ?");
-    params.push(updates.success);
-  }
-  if (updates.failed !== undefined) {
-    parts.push("failed = ?");
-    params.push(updates.failed);
-  }
-
-  if (parts.length === 0) return;
-
-  parts.push("updated_at = ?");
-  params.push(nowMs());
-
-  await dbRun(db, `UPDATE token_refresh_progress SET ${parts.join(", ")} WHERE id = 1`, params);
 }
